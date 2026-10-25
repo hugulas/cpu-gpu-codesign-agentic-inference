@@ -1,122 +1,124 @@
 #!/usr/bin/env python3
-"""
-Phase 3: Load generator for GPU utilization profiling.
-Generates sustained load at various concurrency levels while
-py-spy and rocm-smi capture CPU and GPU utilization.
-"""
+"""Run closed-batch synthetic chat load with strict result validation."""
+
+from __future__ import annotations
+
+import argparse
 import asyncio
-import aiohttp
-import json
-import time
-import os
 import sys
+import time
+from pathlib import Path
 
-MODEL = os.environ.get("MODEL_NAME", "/work/models/MiniMax-M2.5")
-URL = os.environ.get("API_URL", "http://127.0.0.1:8000/v1/chat/completions")
-OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/work/results/cpu-gpu-codesign/phase3")
+import aiohttp
+from transformers import AutoTokenizer
 
-
-async def send_request(session, ctx_size):
-    text = "Analyze this code for performance issues. " * (ctx_size // 6 + 1)
-    payload = {
-        "model": MODEL,
-        "messages": [
-            {"role": "system", "content": "You are helpful. " * 200},
-            {"role": "user", "content": text[:ctx_size * 4]},
-        ],
-        "max_tokens": 64,
-        "temperature": 0.0,
-        "stream": True,
-    }
-    t0 = time.perf_counter()
-    token_count = 0
-    first_token_time = None
-    try:
-        async with session.post(URL, json=payload) as resp:
-            async for line in resp.content:
-                line_str = line.decode().strip()
-                if line_str.startswith("data: ") and line_str[6:] != "[DONE]":
-                    try:
-                        c = json.loads(line_str[6:])
-                        delta = c.get("choices", [{}])[0].get("delta", {})
-                        if delta.get("content") or delta.get("reasoning"):
-                            if first_token_time is None:
-                                first_token_time = time.perf_counter()
-                            token_count += 1
-                    except json.JSONDecodeError:
-                        pass
-    except Exception as e:
-        return {"error": str(e), "ctx": ctx_size}
-
-    total_time = time.perf_counter() - t0
-    ttft = (first_token_time - t0) if first_token_time else total_time
-    return {
-        "ctx": ctx_size,
-        "tokens": token_count,
-        "time_s": total_time,
-        "ttft_s": ttft,
-    }
+from benchmark_support import (
+    build_messages,
+    fetch_metrics,
+    fresh_directory,
+    parse_phases,
+    send_chat,
+    write_json,
+    write_results,
+)
 
 
-async def run_phase(concurrency, ctx_size, duration_s=30):
-    print(f"  Running conc={concurrency}, ctx={ctx_size} for {duration_s}s...")
-    connector = aiohttp.TCPConnector(limit=concurrency * 2)
-    timeout = aiohttp.ClientTimeout(total=300)
-    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-        results = []
-        start = time.perf_counter()
-        while time.perf_counter() - start < duration_s:
-            tasks = [send_request(session, ctx_size) for _ in range(concurrency)]
-            batch = await asyncio.gather(*tasks, return_exceptions=True)
-            for r in batch:
-                if isinstance(r, dict) and "error" not in r:
-                    results.append(r)
-        return results
+async def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--api-url", required=True)
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--model-path", required=True)
+    parser.add_argument("--tokenizer-revision")
+    parser.add_argument("--max-model-len", type=int, required=True)
+    parser.add_argument("--max-tokens", type=int, default=64)
+    parser.add_argument("--phases", required=True)
+    parser.add_argument("--output-dir", required=True, type=Path)
+    args = parser.parse_args()
+    fresh_directory(args.output_dir)
 
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model_path,
+        revision=args.tokenizer_revision,
+        trust_remote_code=True,
+    )
+    phases = parse_phases(args.phases)
+    prepared = {}
+    for _, target, _ in phases:
+        messages, count = build_messages(tokenizer, target)
+        if count + args.max_tokens > args.max_model_len:
+            raise ValueError(
+                f"target {target}: prompt={count} + output={args.max_tokens} "
+                f"exceeds max model length {args.max_model_len}"
+            )
+        prepared[target] = (messages, count)
 
-async def main():
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    all_results = {}
-
-    phases = [
-        (1, 1000, 20),
-        (4, 8000, 30),
-        (16, 32000, 40),
-        (32, 32000, 40),
-        (32, 100000, 40),
-    ]
-
-    for conc, ctx, dur in phases:
-        label = f"conc{conc}_ctx{ctx}"
-        print(f"Phase 3 load: {label}")
-        results = await run_phase(conc, ctx, dur)
-
-        if results:
-            times = [r["time_s"] for r in results]
-            ttfts = [r["ttft_s"] for r in results]
-            all_results[label] = {
-                "concurrency": conc,
-                "context_tokens": ctx,
-                "duration_s": dur,
+    base_url = args.api_url.split("/v1/", 1)[0]
+    timeout = aiohttp.ClientTimeout(total=600)
+    connector = aiohttp.TCPConnector(limit=max(item[0] for item in phases) * 2)
+    summaries = []
+    total_errors = 0
+    async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+        for phase_index, (concurrency, target, duration) in enumerate(phases):
+            name = f"p{phase_index}-c{concurrency}-ctx{target}"
+            phase_dir = args.output_dir / name
+            phase_dir.mkdir()
+            (phase_dir / "before.prom").write_text(
+                await fetch_metrics(session, base_url)
+            )
+            messages, count = prepared[target]
+            results = []
+            started = time.perf_counter()
+            batch_index = 0
+            while time.perf_counter() - started < duration:
+                batch = await asyncio.gather(
+                    *(
+                        send_chat(
+                            session,
+                            args.api_url,
+                            f"{name}-b{batch_index}-r{rank}",
+                            args.model,
+                            messages,
+                            target,
+                            count,
+                            args.max_tokens,
+                        )
+                        for rank in range(concurrency)
+                    )
+                )
+                results.extend(batch)
+                batch_index += 1
+            elapsed = time.perf_counter() - started
+            (phase_dir / "after.prom").write_text(
+                await fetch_metrics(session, base_url)
+            )
+            write_results(phase_dir / "requests.jsonl", results)
+            valid = [item for item in results if item.error is None]
+            errors = len(results) - len(valid)
+            total_errors += errors
+            summary = {
+                "concurrency": concurrency,
+                "context_target": target,
+                "local_prompt_tokens": count,
+                "planned_duration_s": duration,
+                "elapsed_s": elapsed,
                 "count": len(results),
-                "mean_time_s": sum(times) / len(times),
-                "p50_time_s": sorted(times)[len(times) // 2],
-                "mean_ttft_s": sum(ttfts) / len(ttfts),
-                "total_tokens": sum(r["tokens"] for r in results),
-                "throughput_req_per_s": len(results) / dur,
+                "success_count": len(valid),
+                "error_count": errors,
+                "throughput_req_s": len(valid) / elapsed,
+                "throughput_output_tok_s": sum(
+                    item.output_tokens for item in valid
+                )
+                / elapsed,
             }
-            mt = all_results[label]["mean_time_s"]
-            print(f"  -> {len(results)} requests, {mt:.1f}s mean, "
-                  f"{all_results[label]['throughput_req_per_s']:.1f} req/s")
-        else:
-            all_results[label] = {"count": 0, "error": "no successful requests"}
-            print(f"  -> 0 successful requests")
+            write_json(phase_dir / "summary.json", summary)
+            summaries.append(summary)
 
-    output_file = os.path.join(OUTPUT_DIR, "load_test_results.json")
-    with open(output_file, "w") as f:
-        json.dump(all_results, f, indent=2)
-    print(f"\nResults saved to {output_file}")
+    write_json(
+        args.output_dir / "load_test_results.json",
+        {"schema_version": 2, "phases": summaries, "total_errors": total_errors},
+    )
+    return 0 if total_errors == 0 else 1
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    sys.exit(asyncio.run(main()))
